@@ -26,6 +26,10 @@ import {
  * 🔧 HELPER: Clean and validate geometry
  * Ensures Turf.js receives valid input
  */
+/**
+ * 🔧 HELPER: Clean and validate geometry
+ * Ensures Turf.js receives valid input
+ */
 function cleanGeometry(geom) {
   if (!geom || !geom.type || !geom.coordinates) return null;
   
@@ -33,11 +37,11 @@ function cleanGeometry(geom) {
   if (geom.type === 'MultiLineString' || geom.type === 'MultiPolygon') {
     const parts = geom.coordinates;
     const largest = parts.reduce((a, b) =>
-      (Array.isArray(a) ? a.flat(Infinity).length : 0) > 
+      (Array.isArray(a) ? a.flat(Infinity).length : 0) >
       (Array.isArray(b) ? b.flat(Infinity).length : 0) ? a : b
     );
     return {
-      type: geom.type.replace('Multi', ''), // "MultiLineString" → "LineString"
+      type: geom.type.replace('Multi', ''),
       coordinates: largest
     };
   }
@@ -46,9 +50,11 @@ function cleanGeometry(geom) {
   if (Array.isArray(geom.coordinates)) {
     const cleanCoords = geom.coordinates.map(coord => {
       if (Array.isArray(coord)) {
+        // coord is [lon, lat] or similar → clean each value
         return coord.map(c => typeof c === 'string' ? parseFloat(c) : c);
       }
-      return typeof c === 'string' ? parseFloat(c) : c;
+      // coord is a single value → clean it directly ✅ FIXED HERE
+      return typeof coord === 'string' ? parseFloat(coord) : coord;
     });
     return { ...geom, coordinates: cleanCoords };
   }

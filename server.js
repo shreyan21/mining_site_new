@@ -6,7 +6,53 @@ import * as turf from '@turf/turf'; // Namespace import for all Turf functions
 import { fetchSpatialData, pool } from './database/db.js';
 import { createSchoolBuffers, extractCorners, sampleRoadPoints } from './utils/geometry.js';
 import { buildVisibilityEdges, runDijkstra } from './pathfinder/graph.js';
-
+/**
+ * 🔧 HELPER: Clean geometry for Turf.js compatibility
+ * Handles MultiPolygonZM, removes Z/M dimensions, ensures valid GeoJSON
+ */
+function cleanGeometryForTurf(geom) {
+  if (!geom?.type || !geom?.coordinates) return null;
+  
+  // Handle Multi* geometries: take the largest part
+  if (geom.type.startsWith('Multi')) {
+    const simpleType = geom.type.replace('Multi', '');
+    const parts = geom.coordinates;
+    
+    // Find largest part by coordinate count
+    const largest = parts.reduce((a, b) => {
+      const countA = Array.isArray(a) ? a.flat(Infinity).filter(c => typeof c === 'number').length : 0;
+      const countB = Array.isArray(b) ? b.flat(Infinity).filter(c => typeof c === 'number').length : 0;
+      return countA > countB ? a : b;
+    });
+    
+    geom = { type: simpleType, coordinates: largest };
+  }
+  
+  // Remove Z/M dimensions: keep only [lon, lat]
+  if (Array.isArray(geom.coordinates)) {
+    const cleanCoords = geom.coordinates.map(ring => {
+      if (Array.isArray(ring)) {
+        return ring.map(coord => {
+          if (Array.isArray(coord) && coord.length >= 2) {
+            // Keep only first two values: [lon, lat]
+            return [Number(coord[0]), Number(coord[1])];
+          }
+          return coord;
+        });
+      }
+      return ring;
+    });
+    geom = { ...geom, coordinates: cleanCoords };
+  }
+  
+  // Validate coordinates are in degree range (not meters)
+  const firstCoord = geom.coordinates?.[0]?.[0];
+  if (firstCoord && (Math.abs(firstCoord[0]) > 180 || Math.abs(firstCoord[1]) > 90)) {
+    throw new Error('Coordinates appear to be in meters, not degrees');
+  }
+  
+  return geom;
+}
 const app = express();
 app.use(cors()); // Allows frontend (OpenLayers) to call this API
 app.use(express.json());
@@ -373,11 +419,20 @@ app.get('/api/connect', async (req, res) => {
  * 
  * 📤 OUTPUT: Array of mine connectivity info
  */
+/**
+ * 🌐 ROUTE: GET /api/mines/connectivity
+ * 
+ * 🎯 WHAT IT DOES:
+ * Pre-computes connectivity status for all mines.
+ * Helps frontend show which mines are easy to connect.
+ * 
+ * 📤 OUTPUT: Array of mine connectivity info
+ */
 app.get('/api/mines/connectivity', async (req, res) => {
   try {
     console.log('🔍 Pre-computing mine connectivity...');
     
-    // Fetch all mines and roads (simplified for speed)
+    // Fetch all mines and roads
     const minesRes = await pool.query('SELECT gid, name, ST_AsGeoJSON(geom) AS geom FROM mines');
     const roadsRes = await pool.query('SELECT ST_AsGeoJSON(geom) AS geom FROM roads');
     
@@ -385,38 +440,73 @@ app.get('/api/mines/connectivity', async (req, res) => {
     const results = [];
     
     for (const mineRow of minesRes.rows) {
-      const mine = { gid: mineRow.gid, name: mineRow.name, geom: JSON.parse(mineRow.geom) };
-      const mineCenter = turf.centerOfMass(mine).geometry.coordinates;
+      // ✅ FIX 1: Parse geometry from database
+      const rawGeom = JSON.parse(mineRow.geom);
       
-      // Quick distance check to nearest road (no obstacle avoidance)
+      // ✅ FIX 2: Clean geometry for Turf.js compatibility
+      let cleanGeom;
+      try {
+        cleanGeom = cleanGeometryForTurf(rawGeom);
+      } catch (err) {
+        console.warn(`⚠️ Skipping mine ${mineRow.gid}: ${err.message}`);
+        continue;
+      }
+      
+      if (!cleanGeom) continue;
+      
+      // ✅ FIX 3: Create proper GeoJSON Feature for Turf
+      const mineFeature = {
+        type: 'Feature',
+        geometry: cleanGeom,
+        properties: { gid: mineRow.gid, name: mineRow.name }
+      };
+      
+      // ✅ FIX 4: Safe centerOfMass with bbox fallback
+      let mineCenter;
+      try {
+        mineCenter = turf.centerOfMass(mineFeature).geometry.coordinates;
+      } catch (err) {
+        // Fallback: use bounding box center
+        const bbox = turf.bbox(mineFeature);
+        mineCenter = [
+          (bbox[0] + bbox[2]) / 2,
+          (bbox[1] + bbox[3]) / 2
+        ];
+        console.warn(`⚠️ Using bbox center for mine ${mineRow.gid}`);
+      }
+      
+      // Quick distance check to nearest road
       let minDist = Infinity;
       for (const road of roads) {
         try {
+          if (!road?.type || !road?.coordinates) continue;
           const nearest = turf.nearestPointOnLine(road, turf.point(mineCenter));
           const dist = turf.distance(mineCenter, nearest.geometry.coordinates, { units: 'meters' });
           if (dist < minDist) minDist = dist;
-        } catch {}
+        } catch {
+          // Skip problematic roads
+        }
       }
       
       // Categorize by distance
       let status, color, hint;
       if (minDist <= 500) {
         status = 'easy';
-        color = '#2ecc71'; // Green
+        color = '#2ecc71';
         hint = 'Quick connection (<500m)';
       } else if (minDist <= 2000) {
         status = 'moderate';
-        color = '#f39c12'; // Yellow
+        color = '#f39c12';
         hint = 'Moderate distance (500m-2km)';
       } else {
         status = 'hard';
-        color = '#e74c3c'; // Red
+        color = '#e74c3c';
         hint = `Isolated (${Math.round(minDist)}m to nearest road)`;
       }
       
       results.push({
-        gid: mine.gid,
-        name: mine.name,
+        gid: mineRow.gid,
+        name: mineRow.name,
         status,
         color,
         hint,
@@ -430,7 +520,10 @@ app.get('/api/mines/connectivity', async (req, res) => {
     
   } catch (error) {
     console.error('❌ Connectivity check failed:', error);
-    res.status(500).json({ error: 'Failed to compute connectivity' });
+    res.status(500).json({ 
+      error: 'Failed to compute connectivity', 
+      details: error.message 
+    });
   }
 });
 
