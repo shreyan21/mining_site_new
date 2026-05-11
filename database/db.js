@@ -74,39 +74,45 @@ async function checkEdgeSafety(pool, edgeCoords, obstacleGids) {
  * • schools: Points that will become buffered obstacles (Point)
  * • roads: Destination network (MultiLineString) - YOUR GOAL
  */
+
 async function fetchSpatialData(mineGid) {
-  // 🔹 1. Fetch the SELECTED mine (START point)
+  // 1️⃣ Fetch the SELECTED mine (EXCLUDE brick fields)
   const mineRes = await pool.query(
-    'SELECT gid, ST_AsGeoJSON(geom) AS geom FROM mines WHERE gid = $1', 
+    `SELECT gid, ST_AsGeoJSON(geom) AS geom 
+     FROM mines 
+     WHERE gid = $1 
+     AND name NOT ILIKE '%brick%' 
+     AND name NOT ILIKE '%kiln%'`, 
     [mineGid]
   );
-  if (mineRes.rows.length === 0) throw new Error('Mine not found');
+  if (mineRes.rows.length === 0) throw new Error('Mine not found or is a brick field');
 
-  // 🔹 2. Fetch OTHER mines (obstacles - can't build through them)
+  // 2️⃣ Fetch OTHER mines (obstacles) - EXCLUDE brick fields
   const otherMinesRes = await pool.query(
-    'SELECT gid, ST_AsGeoJSON(geom) AS geom FROM mines WHERE gid != $1', 
+    `SELECT gid, ST_AsGeoJSON(geom) AS geom 
+     FROM mines 
+     WHERE gid != $1 
+     AND name NOT ILIKE '%brick%' 
+     AND name NOT ILIKE '%kiln%'`, 
     [mineGid]
   );
 
-  // 🔹 3. Fetch RIVERS (obstacles - can't cross water)
+  // 3️⃣ Fetch RIVERS (no change)
   const riversRes = await pool.query('SELECT gid, ST_AsGeoJSON(geom) AS geom FROM rivers');
 
-  // 🔹 4. Fetch SCHOOLS (will be buffered later based on user input)
+  // 4️⃣ Fetch SCHOOLS (no change)
   const schoolsRes = await pool.query('SELECT gid, ST_AsGeoJSON(geom) AS geom FROM schools');
 
-  // 🔹 5. Fetch ROADS (destination - connect to ANY point on ANY road)
-  // 💡 In the future, you can add more road tables here!
+  // 5️⃣ Fetch ROADS (no change)
   const roadsRes = await pool.query('SELECT gid, ST_AsGeoJSON(geom) AS geom FROM roads');
 
-  // 🔧 HELPER: Convert database row → GeoJSON Feature
-  // This makes the data compatible with Turf.js functions
+  // Helper: Convert database row → GeoJSON Feature
   const toFeature = (row, properties = {}) => ({
     type: 'Feature',
-    geometry: JSON.parse(row.geom), // Convert string → object
+    geometry: JSON.parse(row.geom),
     properties: { gid: row.gid, ...properties }
   });
 
-  // 📦 Return everything in a clean, structured object
   return {
     mine: toFeature(mineRes.rows[0]),
     obstacles: {
@@ -114,9 +120,7 @@ async function fetchSpatialData(mineGid) {
       rivers: riversRes.rows.map(r => toFeature(r))
     },
     schools: schoolsRes.rows.map(r => toFeature(r)),
-    // 🚀 FUTURE-PROOF: Add more road tables here easily!
     roads: roadsRes.rows.map(r => toFeature(r))
   };
 }
-
 export { pool, fetchSpatialData,checkEdgeSafety };
