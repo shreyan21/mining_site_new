@@ -56,6 +56,32 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const SCHOOL_DISTRICT_COORDS = {
+  Azamgarh: [83.1846, 26.0739],
+  Deoria: [83.7870, 26.5017],
+  Gorakhpur: [83.3732, 26.7606],
+  'Kushi Nagar': [83.9823, 26.7399],
+  Maharajganj: [83.5654, 27.1446],
+  Mau: [83.5611, 25.9417],
+  'Sant Kabir Nagar': [83.0629, 26.7906],
+  'Siddharth Nagar': [83.0718, 27.2716],
+};
+
+function schoolDisplayGeometry(row, index) {
+  const districtCenter = SCHOOL_DISTRICT_COORDS[row.field3];
+  if (!districtCenter) return JSON.parse(row.geom);
+
+  const angle = index * 2.399963229728653;
+  const radius = 0.006 + (index % 12) * 0.0025;
+  return {
+    type: 'Point',
+    coordinates: [
+      districtCenter[0] + Math.cos(angle) * radius,
+      districtCenter[1] + Math.sin(angle) * radius,
+    ],
+  };
+}
+
 /**
  * 🌐 ROUTE: GET /api/connect
  * Main endpoint for finding mine-to-road paths
@@ -348,6 +374,59 @@ app.get('/api/connect', async (req, res) => {
  */
 app.get('/api/mines/connectivity', async (req, res) => {
   try {
+    console.log('Pre-computing mine connectivity with PostGIS...');
+
+    const minesRes = await pool.query(`
+      SELECT
+        m.gid,
+        m.name,
+        ST_X(ST_PointOnSurface(m.geom)) AS lon,
+        ST_Y(ST_PointOnSurface(m.geom)) AS lat,
+        COALESCE(nearest.distance_m, 0) AS distance_to_road_m
+      FROM mines m
+      LEFT JOIN LATERAL (
+        SELECT ST_Distance(m.geom::geography, r.geom::geography) AS distance_m
+        FROM roads r
+        ORDER BY m.geom <-> r.geom
+        LIMIT 1
+      ) nearest ON true
+      WHERE m.name NOT ILIKE '%brick%'
+      AND m.name NOT ILIKE '%kiln%'
+    `);
+
+    const results = minesRes.rows.map((mineRow) => {
+      const minDist = Number(mineRow.distance_to_road_m);
+      let status, color, hint;
+
+      if (minDist <= 500) {
+        status = 'easy'; color = '#2ecc71'; hint = 'Quick connection (<500m)';
+      } else if (minDist <= 2000) {
+        status = 'moderate'; color = '#f39c12'; hint = 'Moderate distance (500m-2km)';
+      } else {
+        status = 'hard'; color = '#e74c3c'; hint = `Isolated (${Math.round(minDist)}m to nearest road)`;
+      }
+
+      return {
+        gid: mineRow.gid,
+        name: mineRow.name,
+        status,
+        color,
+        hint,
+        distance_to_road_m: Math.round(minDist),
+        center: [Number(mineRow.lon), Number(mineRow.lat)]
+      };
+    });
+
+    console.log(`Connectivity computed for ${results.length} mines`);
+    res.json({ mines: results, generated_at: new Date().toISOString() });
+  } catch (error) {
+    console.error('Connectivity check failed:', error);
+    res.status(500).json({ error: 'Failed to compute connectivity' });
+  }
+});
+
+app.get('/api/mines/connectivity-old', async (req, res) => {
+  try {
     console.log('🔍 Pre-computing mine connectivity...');
     
     // ✅ FIX: Filter out brick fields + ONLY select needed columns
@@ -450,6 +529,42 @@ app.get('/api/mine/:gid', async (req, res) => {
  */
 app.get('/api/obstacles', async (req, res) => {
   try {
+    const schoolsRes = await pool.query(`
+      SELECT gid, field3, field7, ST_AsGeoJSON(ST_PointOnSurface(geom), 6) AS geom
+      FROM schools
+    `);
+
+    const riversRes = await pool.query(`
+      SELECT
+        gid,
+        wetname,
+        ST_AsGeoJSON(ST_SimplifyPreserveTopology(geom, 0.005), 5) AS geom
+      FROM rivers
+    `);
+
+    res.json({
+      schools: schoolsRes.rows.map((r, index) => ({
+        gid: r.gid,
+        type: 'school',
+        name: r.field7,
+        district: r.field3,
+        geometry: schoolDisplayGeometry(r, index)
+      })),
+      rivers: riversRes.rows.map((r) => ({
+        gid: r.gid,
+        name: r.wetname,
+        type: 'river',
+        geometry: JSON.parse(r.geom)
+      }))
+    });
+  } catch (error) {
+    console.error('Failed to fetch obstacles:', error);
+    res.status(500).json({ error: 'Failed to fetch obstacles' });
+  }
+});
+
+app.get('/api/obstacles-old', async (req, res) => {
+  try {
     const schoolsRes = await pool.query('SELECT gid, ST_AsGeoJSON(geom) AS geom FROM schools');
     // ✅ ST_Simplify reduces river complexity while keeping shape recognizable
     const riversRes = await pool.query(`
@@ -464,6 +579,46 @@ app.get('/api/obstacles', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch obstacles' });
   }
 });
+
+app.get('/api/roads', async (req, res) => {
+  try {
+    const roadsRes = await pool.query(`
+      SELECT gid, ST_AsGeoJSON(ST_Simplify(geom, 0.0005), 6) AS geom
+      FROM roads
+    `);
+
+    res.json({
+      roads: roadsRes.rows.map((r) => ({
+        gid: r.gid,
+        geometry: JSON.parse(r.geom),
+      })),
+    });
+  } catch (error) {
+    console.error('Failed to fetch roads:', error);
+    res.status(500).json({ error: 'Failed to fetch roads' });
+  }
+});
+app.get('/api/roads', async (req, res) => {
+  try {
+    // ST_Simplify reduces vertex count while keeping shape recognisable.
+    // Tolerance 0.00005 ≈ ~5m at equator — adjust to taste.
+    const result = await pool.query(`
+      SELECT gid, ST_AsGeoJSON(ST_Simplify(geom, 0.00005)) AS geom
+      FROM roads
+    `);
+
+    res.json({
+      roads: result.rows.map(r => ({
+        gid:      r.gid,
+        geometry: JSON.parse(r.geom),
+      })),
+    });
+  } catch (error) {
+    console.error('❌ Failed to fetch roads:', error);
+    res.status(500).json({ error: 'Failed to fetch roads' });
+  }
+});
+
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`🌐 Server running on http://localhost:${PORT}`));
